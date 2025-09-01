@@ -1,0 +1,1 @@
+worker: python kczek_soc_med_bot.py

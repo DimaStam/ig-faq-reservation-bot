@@ -1,0 +1,9 @@
+python-dotenv
+openai
+boto3
+flask
+requests
+apscheduler
+dateparser
+googleapiclient
+google-api-python-client
