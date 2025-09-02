@@ -5,5 +5,4 @@ flask
 requests
 apscheduler
 dateparser
-googleapiclient
 google-api-python-client
