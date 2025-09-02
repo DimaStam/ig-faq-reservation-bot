@@ -35,15 +35,24 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 table = dynamodb.Table("reservations")
 
+def get_google_credentials():
+    """Ładuje credentials z ENV GOOGLE_CREDENTIALS (JSON jako string)."""
+    creds_json = os.getenv("GOOGLE_CREDENTIALS")
+    if not creds_json:
+        raise RuntimeError("Brak GOOGLE_CREDENTIALS w ENV")
+    creds_dict = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    return creds
+
 # Google Calendar
 def add_to_google_calendar(details, date, user_id):
     try:
-        creds = Credentials.from_service_account_file(
-            "credentials.json",
-            scopes=["https://www.googleapis.com/auth/calendar"]
-        )
+        creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds)
-
+        
         event = {
             "summary": details,
             "description": f"Rezerwacja od użytkownika {user_id}",

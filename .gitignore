@@ -1,4 +1,7 @@
 .env
+ceramicstudiobot-822808f3215e.json
+RAILWAY_DEPLOYMENT_GUIDE.md
+tmp_rovodev_test_bot.py
 venv/
 __pycache__/
 *.pyc

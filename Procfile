@@ -1,1 +1,1 @@
-worker: python kczek_soc_med_bot.py
+web: python ig_chat_bot.py
