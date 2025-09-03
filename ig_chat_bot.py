@@ -86,27 +86,50 @@ def add_to_google_calendar(details, date, user_id):
         logging.error(f"❌ Błąd dodawania do Google Calendar: {e}")
 
 def generate_response(user_message):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': user_message},
+            ],
+            timeout=10  # Add timeout to prevent hanging
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f'OpenAI API error: {e}')
+        # Return fallback response instead of crashing
+        return 'Dziękuję za wiadomość! Właściciel studia skontaktuje się z Tobą wkrótce.'
+    
+def get_faq_answer(text: str) -> str | None:
+    t = text.lower()
+    # Pricing
+    if any(k in t for k in ["cena", "koszt", "ile koszt", "ile za", "price"]):
+        return "Cennik: 100 zł za godzinę na osobę."
+    # Hours
+    if any(k in t for k in ["godzin", "otwarte", "czynne", "kiedy", "hours", "pn-sb", "poniedziałek", "sobota"]):
+        return "Godziny otwarcia: poniedziałek–sobota, 12:00–20:00."
+    # Address / Directions
+    if any(k in t for k in ["adres", "dojazd", "lokalizacja", "gdzie", "mapa", "address", "location"]):
+        return "Adres: Komuny Paryskiej 55, 50-452 Wrocław. Zapraszamy!"
+    return None
 
 def send_message(recipient_id, text):
-    url = f"https://graph.facebook.com/v20.0/me/messages?access_token={INSTAGRAM_TOKEN}"
+    url = f"https://graph.facebook.com/v20.0/me/messages"
+    params = {"access_token": INSTAGRAM_TOKEN}
     data = {
         "recipient": {"id": recipient_id},
         "message": {"text": text},
     }
     try:
-        response = requests.post(url, json=data)
+        response = requests.post(url, params=params, json=data)
         if response.status_code != 200:
-            logging.error(f"Instagram API error: {response.status_code} - {response.text}")
+            logging.error(f"❌ Instagram API error: {response.status_code} - {response.text}")
+        else:
+            logging.info(f"📤 Sent to {recipient_id}: {text}")
     except Exception as e:
-        logging.error(f"Error sending message: {e}")
+        logging.error(f"❌ Error sending message: {e}", exc_info=True)
+
 
 def parse_reservation_request(text):
     match_people = re.search(r"(\d+)\s*(osób|osoby|osoba)?", text.lower())
@@ -300,6 +323,7 @@ scheduler.start()
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
+        # Weryfikacja webhooka
         if request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge")
         return "Invalid token", 403
@@ -307,28 +331,39 @@ def webhook():
     if request.method == "POST":
         try:
             data = request.get_json()
-            if data and data.get("object") == "instagram":
+            logging.info(f"📥 Webhook received: {json.dumps(data, indent=2, ensure_ascii=False)}")
+
+            if data and data.get("object") in ("instagram", "page"):
                 for entry in data.get("entry", []):
                     for messaging_event in entry.get("messaging", []):
-                        sender_id = messaging_event["sender"]["id"]
-                        if "message" in messaging_event:
-                            user_message = messaging_event["message"]["text"]
+                        sender_id = messaging_event["sender"].get("id")
+                        user_message = messaging_event.get("message", {}).get("text")
 
-                            # AI odpowiedź
-                            response_text = generate_response(user_message)
-                            send_message(sender_id, response_text)
+                        if not sender_id or not user_message:
+                            logging.warning("⚠️ Webhook event without sender_id or user_message")
+                            continue
 
-                            # logika rezerwacji
-                            if "rezerwacja" in user_message.lower():
-                                reservation = save_reservation(sender_id, user_message, status="pending")
-                                if reservation:
-                                    send_message(
-                                        sender_id,
-                                        f"📝 Twoja rezerwacja jest wstępnie zapisana ({reservation['details']} w dniu {reservation['date'].strftime('%d.%m.%Y %H:%M')}). Właściciel studia musi ją jeszcze potwierdzić ✅.",
-                                    )
+                        logging.info(f"💬 Message from {sender_id}: {user_message}")
+
+                        # AI odpowiedź
+                        response_text = generate_response(user_message)
+                        send_message(sender_id, response_text)
+
+                        # Rezerwacje
+                        if "rezerwacja" in user_message.lower():
+                            reservation = save_reservation(sender_id, user_message, status="pending")
+                            if reservation:
+                                send_message(
+                                    sender_id,
+                                    f"📝 Twoja rezerwacja jest wstępnie zapisana "
+                                    f"({reservation['details']} w dniu {reservation['date'].strftime('%d.%m.%Y %H:%M')}). "
+                                    f"Właściciel studia musi ją jeszcze potwierdzić ✅."
+                                )
+
         except Exception as e:
-            logging.error(f"Webhook error: {e}")
+            logging.error(f"❌ Webhook error: {e}", exc_info=True)
             return "ERROR", 500
+
         return "OK", 200
 
 if __name__ == "__main__":
