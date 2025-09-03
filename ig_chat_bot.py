@@ -2,6 +2,7 @@ import os
 import json
 import re
 import logging
+import threading
 from datetime import datetime, timedelta
 
 import requests
@@ -196,6 +197,18 @@ async def handle_telegram_callback(update, context):
               """
               await query.edit_message_text(details_text, parse_mode='Markdown')
 
+def send_telegram_notification_sync(reservation_id, user_id, details, date):
+    """Synchronous wrapper for Telegram notification"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            send_telegram_reservation_notification(reservation_id, user_id, details, date)
+        )
+        loop.close()
+    except Exception as e:
+        logging.error(f"Telegram notification error: {e}")
+
 # ---- Reservations ----
 def save_reservation(user_id, user_message, status="pending"):
     try:
@@ -216,11 +229,10 @@ def save_reservation(user_id, user_message, status="pending"):
     except ClientError as e:
         logging.error(e)
         # Send Telegram notification instead of email
-        asyncio.create_task(
-            send_telegram_reservation_notification(
-                reservation_id, user_id, reservation["details"], reservation["date"]
-            )
-        )
+        threading.Thread(
+            target=send_telegram_notification_sync,
+            args=(reservation_id, user_id, reservation["details"], reservation["date"])
+        ).start()
     except ClientError as e:
         logging.error(e)
 
