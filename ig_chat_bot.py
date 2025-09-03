@@ -16,6 +16,10 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+import asyncio
+
 # ---- Config ----
 app = Flask(__name__)
 load_dotenv()
@@ -26,7 +30,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 INSTAGRAM_TOKEN = os.getenv("INSTAGRAM_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-SES_EMAIL = os.getenv("SES_EMAIL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OWNER_CHAT_ID = os.getenv("OWNER_TELEGRAM_CHAT_ID")
+
+# Initialize Telegram bot
+telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -34,6 +42,14 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # DynamoDB
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 table = dynamodb.Table("reservations")
+
+SYSTEM_PROMPT = """
+Jesteś botem dla studia ceramiki. Obsługuj:
+- FAQ: ceny (100zł/godz), godziny (pn-sb 12-20), dojazd (Komuny Paryskiej 55, 50-452 Wrocław).
+- Rezerwacje: użytkownik może zapytać o warsztaty. Ty przyjmij szczegóły (liczba osób, data) i zapisz jako „pending”.
+- Edycje i anulowanie: jeśli użytkownik prosi o zmianę lub anulowanie, ustaw status jako „pending_edit” lub „pending_cancel”.
+- Nigdy nie potwierdzaj rezerwacji – to może zrobić tylko właściciel.
+"""
 
 def get_google_credentials():
     """Ładuje credentials z ENV GOOGLE_CREDENTIALS (JSON jako string)."""
@@ -68,16 +84,6 @@ def add_to_google_calendar(details, date, user_id):
     except Exception as e:
         logging.error(f"❌ Błąd dodawania do Google Calendar: {e}")
 
-# System prompt
-SYSTEM_PROMPT = """
-Jesteś botem dla studia ceramiki. Obsługuj:
-- FAQ: ceny (100zł/godz), godziny (pn-sb 12-20), dojazd (Komuny Paryskiej 55, 50-452 Wrocław).
-- Rezerwacje: użytkownik może zapytać o warsztaty. Ty przyjmij szczegóły (liczba osób, data) i zapisz jako „pending”.
-- Edycje i anulowanie: jeśli użytkownik prosi o zmianę lub anulowanie, ustaw status jako „pending_edit” lub „pending_cancel”.
-- Nigdy nie potwierdzaj rezerwacji – to może zrobić tylko właściciel.
-"""
-
-# ---- Helpers ----
 def generate_response(user_message):
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -113,20 +119,82 @@ def parse_reservation_request(text):
         "details": f"Warsztat dla {people} osób",
     }
 
-def send_email(to_address, subject, body):
-    ses = boto3.client("ses", region_name=AWS_REGION)
+async def send_telegram_reservation_notification(reservation_id, user_id, reservation_details, date):
+    """Send reservation notification to owner via Telegram with inline buttons"""
+    message = f"""
+  🏺 **Nowa Rezerwacja - Studio Ceramiki**
+
+  👤 **Klient:** {user_id}
+  📋 **Szczegóły:** {reservation_details}
+  📅 **Data:** {date.strftime('%d.%m.%Y %H:%M')}
+
+  Wybierz akcję:
+      """
+    keyboard = [
+          [
+              InlineKeyboardButton("✅ Potwierdź", callback_data=f"confirm_{reservation_id}_{user_id}"),
+              InlineKeyboardButton("❌ Odrzuć", callback_data=f"reject_{reservation_id}_{user_id}")
+          ],
+          [
+              InlineKeyboardButton("📝 Szczegóły", callback_data=f"details_{reservation_id}_{user_id}"),
+              InlineKeyboardButton("🗑 Anuluj ", callback_data=f"cancel_{reservation_id}_{user_id}")
+          ]
+      ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
     try:
-        ses.send_email(
-            Source=SES_EMAIL,
-            Destination={"ToAddresses": [to_address]},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {"Html": {"Data": body, "Charset": "UTF-8"}},
-            },
-        )
-        logging.info(f"✅ Email wysłany do {to_address}")
+          await telegram_bot.send_message(
+              chat_id=OWNER_CHAT_ID,
+              text=message,
+              reply_markup=reply_markup,
+              parse_mode='Markdown'
+          )
+          logging.info(f"✅ Telegram notification sent for reservation {reservation_id}")
     except Exception as e:
-        logging.error(f"❌ Błąd wysyłania e-maila: {e}")
+          logging.error(f"❌ Error sending Telegram notification: {e}")
+
+async def handle_telegram_callback(update, context):
+      """Handle button clicks from Telegram"""
+      query = update.callback_query
+      await query.answer()
+
+      # Parse callback data: action_reservationId_userId
+      action, reservation_id, user_id = query.data.split('_', 2)
+
+      if action == "confirm":
+          update_reservation_status(reservation_id, user_id, "confirmed")
+
+          # Add to Google Calendar
+          item = table.get_item(Key={"user_id": user_id, "reservation_id": reservation_id}).get("Item")
+          if item:
+              add_to_google_calendar(item["details"], datetime.fromisoformat(item["date"]), user_id)
+
+          send_message(user_id, "✅ Twoja rezerwacja została potwierdzona!")
+          await query.edit_message_text("✅ Rezerwacja potwierdzona!")
+
+      elif action == "reject":
+          update_reservation_status(reservation_id, user_id, "rejected")
+          send_message(user_id, "❌ Twoja rezerwacja została odrzucona.")
+          await query.edit_message_text("❌ Rezerwacja odrzucona!")
+
+      elif action == "cancel":
+          update_reservation_status(reservation_id, user_id, "cancelled")
+          send_message(user_id, "🗑 Twoja rezerwacja została anulowana.")
+          await query.edit_message_text("🗑 Rezerwacja anulowana!")
+
+      elif action == "details":
+          # Show detailed reservation info
+          item = table.get_item(Key={"user_id": user_id, "reservation_id": reservation_id}).get("Item")
+          if item:
+              details_text = f"""
+  📋 **Szczegóły Rezerwacji**
+  🆔 **ID:** {reservation_id}
+  👤 **Klient:** {user_id}
+  📝 **Opis:** {item['details']}
+  📅 **Data:** {item['date']}
+  📊 **Status:** {item['status']}
+              """
+              await query.edit_message_text(details_text, parse_mode='Markdown')
 
 # ---- Reservations ----
 def save_reservation(user_id, user_message, status="pending"):
@@ -134,7 +202,7 @@ def save_reservation(user_id, user_message, status="pending"):
         reservation = parse_reservation_request(user_message)
         reservation_id = str(datetime.now().timestamp())
 
-        # Zapis do DynamoDB
+        # Save to DynamoDB
         table.put_item(
             Item={
                 "user_id": user_id,
@@ -145,24 +213,17 @@ def save_reservation(user_id, user_message, status="pending"):
                 "reminded": False,
             }
         )
+    except ClientError as e:
+        logging.error(e)
+        # Send Telegram notification instead of email
+        asyncio.create_task(
+            send_telegram_reservation_notification(
+                reservation_id, user_id, reservation["details"], reservation["date"]
+            )
+        )
+    except ClientError as e:
+        logging.error(e)
 
-        # Wyślij mail do właściciela
-        link_confirm = f"http://localhost:5000/admin/confirm?reservation_id={reservation_id}&user_id={user_id}&action=confirm"
-        link_reject = f"http://localhost:5000/admin/confirm?reservation_id={reservation_id}&user_id={user_id}&action=reject"
-        link_cancel = f"http://localhost:5000/admin/confirm?reservation_id={reservation_id}&user_id={user_id}&action=cancel"
-
-        email_body = f"""
-        <p>Nowa rezerwacja od <b>{user_id}</b></p>
-        <p><b>{reservation['details']}</b> na {reservation['date'].strftime('%d.%m.%Y %H:%M')}</p>
-        <p>Potwierdź lub odrzuć rezerwację:</p>
-        <ul>
-          <li><a href="{link_confirm}">✅ Potwierdź</a></li>
-          <li><a href="{link_reject}">❌ Odrzuć</a></li>
-          <li><a href="{link_cancel}">🗑️ Anuluj</a></li>
-        </ul>
-        """
-
-        send_email(SES_EMAIL, "Nowa rezerwacja – Studio Ceramiki", email_body)
         return reservation
     except ClientError as e:
         logging.error(e)
@@ -178,6 +239,19 @@ def update_reservation_status(reservation_id, user_id, new_status):
         )
     except ClientError as e:
         logging.error(e)
+
+async def setup_telegram_bot():
+    """Setup Telegram bot handlers"""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add callback handler for button clicks
+    application.add_handler(CallbackQueryHandler(handle_telegram_callback))
+
+    # Start the bot
+    await application.initialize()
+    await application.start()
+
+    return application
 
 # ---- Scheduler (przypomnienia) ----
 def send_reminders():
@@ -245,37 +319,11 @@ def webhook():
             return "ERROR", 500
         return "OK", 200
 
-# ---- Admin confirm via email links ----
-@app.route("/admin/confirm", methods=["GET"])
-def admin_confirm():
-    reservation_id = request.args.get("reservation_id")
-    user_id = request.args.get("user_id")
-    action = request.args.get("action")
-
-    if not all([reservation_id, user_id, action]):
-        return "❌ Brak danych", 400
-
-    if action == "confirm":
-        update_reservation_status(reservation_id, user_id, "confirmed")
-        # pobierz rezerwację z DB
-        item = table.get_item(
-            Key={"user_id": user_id, "reservation_id": reservation_id}
-        ).get("Item")
-        if item:
-            add_to_google_calendar(item["details"], datetime.fromisoformat(item["date"]), user_id)
-        send_message(user_id, "✅ Twoja rezerwacja została potwierdzona!")
-        return "Rezerwacja potwierdzona ✅"
-    elif action == "reject":
-        update_reservation_status(reservation_id, user_id, "rejected")
-        send_message(user_id, "❌ Twoja rezerwacja została odrzucona.")
-        return "Rezerwacja odrzucona ❌"
-    elif action == "cancel":
-        update_reservation_status(reservation_id, user_id, "cancelled")
-        send_message(user_id, "🗑️ Twoja rezerwacja została anulowana.")
-        return "Rezerwacja anulowana 🗑️"
-    else:
-        return "❌ Nieznana akcja", 400
-
 if __name__ == "__main__":
+    # Setup Telegram bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    telegram_app = loop.run_until_complete(setup_telegram_bot())
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)

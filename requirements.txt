@@ -6,3 +6,4 @@ requests
 apscheduler
 dateparser
 google-api-python-client
+python-telegram-bot==20.3
