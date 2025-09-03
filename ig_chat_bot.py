@@ -115,7 +115,7 @@ def get_faq_answer(text: str) -> str | None:
     return None
 
 def send_message(recipient_id, text):
-    url = f"https://graph.facebook.com/v20.0/me/messages"
+    url = f"https://graph.facebook.com/v23.0/me/messages"
     params = {"access_token": INSTAGRAM_TOKEN}
     data = {
         "recipient": {"id": recipient_id},
