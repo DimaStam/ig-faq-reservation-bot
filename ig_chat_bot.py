@@ -45,11 +45,29 @@ dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 table = dynamodb.Table("reservations")
 
 SYSTEM_PROMPT = """
-Jesteś botem dla studia ceramiki. Obsługuj:
-- FAQ: ceny (100zł/godz), godziny (pn-sb 12-20), dojazd (Komuny Paryskiej 55, 50-452 Wrocław).
-- Rezerwacje: użytkownik może zapytać o warsztaty. Ty przyjmij szczegóły (liczba osób, data) i zapisz jako „pending”.
-- Edycje i anulowanie: jeśli użytkownik prosi o zmianę lub anulowanie, ustaw status jako „pending_edit” lub „pending_cancel”.
-- Nigdy nie potwierdzaj rezerwacji – to może zrobić tylko właściciel.
+Jesteś ekspertem ceramiki i asystentem Studio Ceramiki we Wrocławiu. 
+
+TWOJA ROLA:
+- Odpowiadaj na ZŁOŻONE pytania o ceramikę, techniki, artystyczne aspekty
+- Pomagaj z rezerwacjami gdy potrzebne jest przetworzenie języka naturalnego
+- Doradzaj w kwestiach artystycznych i technicznych
+- Bądź ciepły, zachęcający i profesjonalny
+
+NIE ODPOWIADAJ na podstawowe FAQ (ceny, godziny, adres) - to obsługuje system automatyczny.
+
+REZERWACJE:
+- Jeśli użytkownik chce zarezerwować, wyciągnij: liczbę osób, datę/czas, szczególne wymagania
+- Zawsze zapisuj jako 'pending' - tylko właściciel może potwierdzić
+- Jeśli brak informacji, zapytaj uprzejmie o szczegóły
+
+PRZYKŁADY DOBRYCH ODPOWIEDZI:
+- Pytania o techniki ceramiczne
+- Porady dla początkujących  
+- Inspiracje artystyczne
+- Złożone scenariusze rezerwacji
+- Pytania o poziom trudności projektów
+
+Odpowiadaj po polsku, używaj emoji oszczędnie, bądź konkretny i pomocny
 """
 
 def get_google_credentials():
@@ -101,17 +119,53 @@ def generate_response(user_message):
         # Return fallback response instead of crashing
         return 'Dziękuję za wiadomość! Właściciel studia skontaktuje się z Tobą wkrótce.'
     
-def get_faq_answer(text: str) -> str | None:
+def get_faq_answer(text):
+    '''Comprehensive FAQ for Studio Ceramiki'''
     t = text.lower()
+    # Hours/Opening times
+    if any(k in t for k in ['kiedy', 'godzin', 'otwarte', 'czynne', 'hours', 'open', 'pracuj', 'dostępn']):
+        return '🕐 Godziny otwarcia: poniedziałek–sobota, 12:00–20:00.'
     # Pricing
-    if any(k in t for k in ["cena", "koszt", "ile koszt", "ile za", "price"]):
-        return "Cennik: 100 zł za godzinę na osobę."
-    # Hours
-    if any(k in t for k in ["godzin", "otwarte", "czynne", "kiedy", "hours", "pn-sb", "poniedziałek", "sobota"]):
-        return "Godziny otwarcia: poniedziałek–sobota, 12:00–20:00."
-    # Address / Directions
-    if any(k in t for k in ["adres", "dojazd", "lokalizacja", "gdzie", "mapa", "address", "location"]):
-        return "Adres: Komuny Paryskiej 55, 50-452 Wrocław. Zapraszamy!"
+    if any(k in t for k in ['cena', 'koszt', 'ile koszt', 'ile za', 'price', 'płać', 'opłat']):
+        return '💰 Cennik: 100 zł za godzinę na osobę.'
+    # Address/Location
+    if any(k in t for k in ['adres', 'dojazd', 'lokalizacja', 'gdzie', 'address', 'location', 'mapa']):
+        return '📍 Adres: Komuny Paryskiej 55, 50-452 Wrocław. Zapraszamy!'
+    # Reservation FAQ
+    if any(k in t for k in ['jak zarezerwować', 'jak się zapisać', 'rezerwacja', 'booking', 'zapisy']):
+        return '''📅 **Jak zarezerwować warsztat:**
+        
+1. Napisz do mnie: "Chcę zarezerwować warsztat"
+2. Podaj liczbę osób i preferowaną datę
+3. Właściciel potwierdzi dostępność
+4. Otrzymasz potwierdzenie
+
+Przykład: "Chcę zarezerwować warsztat dla 3 osób na piątek o 16:00"'''
+    
+    # What to expect
+    if any(k in t for k in ['czego się spodziewać', 'co będziemy robić', 'warsztat', 'program', 'zajęcia']):
+        return '''🏺 **Co oferujemy:**
+        
+• Warsztaty ceramiczne dla początkujących i zaawansowanych
+• Praca z gliną na kole garncarskim
+• Malowanie i glazurowanie
+• Czas trwania: około 2 godziny
+• Wszystkie materiały wliczone w cenę
+• Gotowe prace odbierzesz po wypaleniu (5-7 dni)'''
+    
+    # Group sizes
+    if any(k in t for k in ['ile osób', 'grupa', 'maksymalnie', 'group size', 'capacity']):
+        return '👥 Przyjmujemy grupy od 1 do 8 osób. Dla większych grup skontaktuj się z właścicielem.'
+    # Materials/Equipment
+    if any(k in t for k in ['materiały', 'co przynieść', 'equipment', 'tools', 'przygotować']):
+        return '🎨 Wszystkie materiały zapewniamy: glina, narzędzia, farby, glazury. Wystarczy przyjść w wygodnym ubraniu!'
+    # Experience level
+    if any(k in t for k in ['początkujący', 'doświadczenie', 'beginner', 'advanced', 'poziom']):
+        return '⭐ Warsztaty dla wszystkich poziomów! Początkujący są mile widziani - nauczymy Cię podstaw krok po kroku.'
+    # Age restrictions
+    if any(k in t for k in ['wiek', 'dzieci', 'age', 'kids', 'family']):
+        return '👶 Dzieci powyżej 8 lat w towarzystwie dorosłych. Warsztaty rodzinne bardzo mile widziane!'
+    
     return None
 
 def send_message(recipient_id, text):
@@ -320,51 +374,69 @@ scheduler.add_job(send_reminders, "interval", hours=1)
 scheduler.start()
 
 # ---- Webhook ----
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    if request.method == "GET":
-        # Weryfikacja webhooka
-        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-            return request.args.get("hub.challenge")
-        return "Invalid token", 403
+    if request.method == 'GET':
+        if request.args.get('hub.verify_token') == VERIFY_TOKEN:
+            return request.args.get('hub.challenge')
+        return 'Invalid token', 403
 
-    if request.method == "POST":
+    if request.method == 'POST':
         try:
             data = request.get_json()
-            logging.info(f"📥 Webhook received: {json.dumps(data, indent=2, ensure_ascii=False)}")
+            logging.info(f'📥 Webhook received: {json.dumps(data, indent=2)}')
+            
+            # Accept both Instagram and Messenger events
+            if data and data.get('object') in ('instagram', 'page'):
+                for entry in data.get('entry', []):
+                    for messaging_event in entry.get('messaging', []):
+                        sender_id = messaging_event['sender']['id']
+                        
+                        # CRITICAL: Ignore echo messages (bot's own responses)
+                        if 'message' in messaging_event and not messaging_event['message'].get('is_echo', False):
+                            if 'text' in messaging_event['message']:
+                                user_message = messaging_event['message']['text']
+                                
+                                logging.info(f'💬 Message from {sender_id}: {user_message}')
+                                
+                                # STEP 1: Try FAQ first (instant, reliable)
+                                faq_reply = get_faq_answer(user_message)
+                                if faq_reply:
+                                    logging.info(f'📚 FAQ match found for: {user_message}')
+                                    send_message(sender_id, faq_reply)
+                                else:
+                                    # STEP 2: AI response for complex questions
+                                    try:
+                                        logging.info(f'🤖 Calling OpenAI for: {user_message}')
+                                        response_text = generate_response(user_message)
+                                        send_message(sender_id, response_text)
+                                    except Exception as e:
+                                        logging.error(f'❌ OpenAI error: {e}')
+                                        fallback_msg = 'Dziękuję za wiadomość! Właściciel studia skontaktuje się z Tobą wkrótce. 🏺'
+                                        send_message(sender_id, fallback_msg)
 
-            if data and data.get("object") in ("instagram", "page"):
-                for entry in data.get("entry", []):
-                    for messaging_event in entry.get("messaging", []):
-                        sender_id = messaging_event["sender"].get("id")
-                        user_message = messaging_event.get("message", {}).get("text")
+                                # STEP 3: Reservation handling (if contains 'rezerwacja')
+                                if 'rezerwacja' in user_message.lower() or 'zarezerwować' in user_message.lower():
+                                    try:
+                                        logging.info(f'📅 Processing reservation request from {sender_id}')
+                                        reservation = save_reservation(sender_id, user_message, status='pending')
+                                        if reservation:
+                                            confirmation_msg = f'''✅ Twoja rezerwacja jest wstępnie zapisana:
+                                            
+📋 **Szczegóły:** {reservation['details']}
+📅 **Data:** {reservation['date'].strftime('%d.%m.%Y %H:%M')}
 
-                        if not sender_id or not user_message:
-                            logging.warning("⚠️ Webhook event without sender_id or user_message")
-                            continue
-
-                        logging.info(f"💬 Message from {sender_id}: {user_message}")
-
-                        # AI odpowiedź
-                        response_text = generate_response(user_message)
-                        send_message(sender_id, response_text)
-
-                        # Rezerwacje
-                        if "rezerwacja" in user_message.lower():
-                            reservation = save_reservation(sender_id, user_message, status="pending")
-                            if reservation:
-                                send_message(
-                                    sender_id,
-                                    f"📝 Twoja rezerwacja jest wstępnie zapisana "
-                                    f"({reservation['details']} w dniu {reservation['date'].strftime('%d.%m.%Y %H:%M')}). "
-                                    f"Właściciel studia musi ją jeszcze potwierdzić ✅."
-                                )
-
+Właściciel studia potwierdzi dostępność w ciągu kilku godzin. Otrzymasz wiadomość z potwierdzeniem lub propozycją innego terminu.'''
+                                            send_message(sender_id, confirmation_msg)
+                                    except Exception as e:
+                                        logging.error(f'❌ Reservation error: {e}')
+                                        send_message(sender_id, 'Wystąpił problem z zapisaniem rezerwacji. Spróbuj ponownie lub skontaktuj się bezpośrednio z właścicielem.')
+                            
         except Exception as e:
-            logging.error(f"❌ Webhook error: {e}", exc_info=True)
-            return "ERROR", 500
-
-        return "OK", 200
+            logging.error(f'❌ Webhook error: {e}')
+            return 'ERROR', 500
+        
+        return 'OK', 200
 
 if __name__ == "__main__":
     # Setup Telegram bot
