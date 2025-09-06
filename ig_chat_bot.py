@@ -6,7 +6,10 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 import requests
 import boto3
 from botocore.exceptions import ClientError
@@ -35,6 +38,95 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_CHAT_ID = os.getenv("OWNER_TELEGRAM_CHAT_ID")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+# Godziny pracy studia: 0=pon, 6=niedz. None oznacza zamkniete.
+OPENING_HOURS = {
+    0: None,
+    1: (10, 20),
+    2: (10, 20),
+    3: (10, 20),
+    4: (10, 20),
+    5: (10, 18),
+    6: (10, 18),
+}
+
+def get_user_display_name(user_id: str) -> str | None:
+    """Fetch only the Instagram/Messenger username from profile."""
+    try:
+        url = f"https://graph.facebook.com/v23.0/{user_id}"
+        params = {
+            "access_token": INSTAGRAM_TOKEN,
+            "fields": "username",
+        }
+        resp = requests.get(url, params=params, timeout=5)
+        if resp.status_code != 200:
+            logging.warning(f"Profile fetch failed {resp.status_code}: {resp.text}")
+            return None
+        data = resp.json() if resp.text else {}
+        un = (data.get("username") or "").strip()
+        return un or None
+    except Exception as e:
+        logging.error(f"Error fetching display name: {e}")
+        return None
+
+def parse_duration_hours(text: str) -> int | None:
+    """Extract duration in hours from free text (e.g., '2h', '2 godziny')."""
+    t = text.lower()
+    m = re.search(r"\b(\d{1,2})\s*(?:h|godz|godzina|godziny|godzin|hour|hours)?\b", t)
+    if m:
+        try:
+            val = int(m.group(1))
+            if 1 <= val <= 8:
+                return val
+        except ValueError:
+            return None
+    return None
+
+# --- Text sanitization ---
+def sanitize_text(s: str | None) -> str:
+    if not s:
+        return ""
+    t = str(s)
+    repl = {
+        "Wroc�'aw": "Wrocław",
+        "Wroc�'awiu": "Wrocławiu",
+        "Jeste�": "Jesteś",
+        "si�T": "się",
+        "si�": "się",
+        "Nie uda�'o": "Nie udało",
+        "spr�?buj": "spróbuj",
+        "dost�Tpno�": "dostępno",
+        "dost�Tpno": "dostępno",
+        "dostepnosci": "dostępności",
+        "zaj�Tty": "zajęty",
+        "zaj�T": "zaję",
+        "w�'a�": "właś",
+        "w�'a": "wła",
+        "wiadomo�": "wiadomoś",
+        "rezerwacj�T": "rezerwację",
+        "Godziny": "Godziny",
+        "Prosz�T": "Proszę",
+        "godzin�T": "godzinę",
+        "dzie�": "dzień",
+        "wrze�": "wrześ",
+        "os�?b": "osób",
+        "os�": "osó",
+        "Potwierd��": "Potwierdź",
+        "Odrzu��": "Odrzuć",
+        "Szczeg�": "Szczegó",
+        "Wysy�'a": "Wysyła",
+        "pi�:tek": "piątek",
+        "Je�": "Jeś",
+        "�??": "",
+        "�'": "",
+        "�": "",
+    }
+    for k, v in repl.items():
+        t = t.replace(k, v)
+    # Normalize multiple spaces leftover
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 # Initialize Telegram bot
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -59,9 +151,24 @@ Jesteś asystentem Studio Ceramiki we Wrocławiu. Obsługujesz klientów na Inst
 
 [CEL]
 - Odpowiadaj na proste pytania FAQ (adres, godziny otwarcia, ceny).
-- Obsługuj rezerwacje: rozpoznawaj intencję rezerwacji i wyciągaj potrzebne dane (liczba osób, data i godzina).
+- Obsługuj rezerwacje: rozpoznawaj intencję rezerwacji i wyciągaj potrzebne dane (liczba osób, data i godzina, czas trwania zajęcia).
 - Sprawdzaj dostępność terminów w kalendarzu Google.
 - Informuj klienta o statusie rezerwacji (oczekuje, potwierdzona, odrzucona).
+
+[FAQ]
+- Adres: Komuny Paryskiej 55, Wrocław
+- Godziny otwarcia: Pon-Pt 10:00-18:00, Sob 10:00-14:00, Nd nieczynne
+- Ceny szkliwienie ceramiki: 120zł za 1 godzinę, 150zł za 2 godziny
+- Ceny Koło:
+Dla dzjeci (6-17 lat)
+• Karnet: 3 spotkania przy kole garncarskim (ok. 2 godz. każde) + 1 zajecia ze szkliwienia. Cena: 390zł.
+• Zajecia: cena 100 zł
+Dla par
+• 3 spotkania przy kole garncarskim (ok. 2 godz. kazde) + 1 zajecia ze szkliwienia. Cena: 480 zł.
+• Zajecia: cena 120 zł.
+Zajecia indywidualne
+• Karnet: 3 spotkania przy kole garncarskim (ok. 2-2,5 godz. kazde) + 1 zajecia ze szkliwienia wszystkich wykonanych prac. Cena: 560 zł.
+• Zajecia: cena 150 zł.
 
 [ZASADY]
 - Obsługujesz tylko 3 języki: polski, angielski i ukraiński.
@@ -108,20 +215,40 @@ def get_google_credentials():
     )
     return creds
 
-def add_to_google_calendar(details, date, user_id):
+def _hours_to_float(val, default=2.0) -> float:
+    """Coerce hours value (possibly Decimal/str/int) to float for timedelta."""
+    try:
+        if val is None:
+            return float(default)
+        # Avoid bools being treated as ints
+        if isinstance(val, bool):
+            return float(default)
+        return float(val)
+    except Exception:
+        return float(default)
+
+
+def add_to_google_calendar(details, date, user_id, people=None, duration_hours=2):
     try:
         creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds, cache_discovery=False)
         
+        dh = _hours_to_float(duration_hours, default=2.0)
         event = {
             "summary": details,
             "description": f"Rezerwacja od użytkownika {user_id}",
             "start": {"dateTime": date.isoformat(), "timeZone": "Europe/Warsaw"},
-            "end": {"dateTime": (date + timedelta(hours=2)).isoformat(), "timeZone": "Europe/Warsaw"},
+            "end": {"dateTime": (date + timedelta(hours=dh)).isoformat(), "timeZone": "Europe/Warsaw"},
         }
 
+        # Enrich description with people count and IG id
+        try:
+            event["description"] = f"Liczba osob: {people if people is not None else '?'}\nIG: {user_id}"
+        except Exception:
+            pass
+
         event_result = service.events().insert(
-            calendarId="primary", body=event
+            calendarId=GOOGLE_CALENDAR_ID or "primary", body=event
         ).execute()
 
         logging.info(f"✅ Rezerwacja dodana do Google Calendar: {event_result.get('htmlLink')}")
@@ -146,38 +273,160 @@ def generate_response(user_message):
     
 def check_availability_in_calendar(date: datetime, duration_hours=2):
     """
-    Sprawdza dostępność w Google Calendar.
-    Zwraca krotkę: (is_free: bool | None, err: str | None)
-      - is_free == True  -> wolne
-      - is_free == False -> kolizja
-      - is_free == None  -> błąd API/cred (nie wiadomo)
+    Sprawdza dostępność w Google Calendar dla KONKRETNEGO przedziału [start, end).
+    Bazuje na wolnych oknach dnia – nie tylko na eventach zaczynających się w przedziale.
+    Zwraca: (True = wolne, False = zajęte, None = błąd), err
     """
     try:
-        creds = get_google_credentials()
-        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        duration = _hours_to_float(duration_hours, default=2.0)
+        req_start = date
+        req_end = date + timedelta(hours=duration)
 
-        def to_rfc3339_utc(dt: datetime) -> str:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            dt_utc = dt.astimezone(timezone.utc)
-            return dt_utc.isoformat().replace("+00:00", "Z")
-
-        time_min = to_rfc3339_utc(date)
-        time_max = to_rfc3339_utc(date + timedelta(hours=duration_hours))
-
-        events_result = service.events().list(
-            calendarId="primary",
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
-
-        events = events_result.get("items", [])
-        return (len(events) == 0, None)
+        # Wylicz wolne przedziały dla dnia i sprawdź, czy [req_start, req_end) w całości mieści się w którymś z nich
+        free_ranges = compute_free_ranges_for_day(date, duration)
+        for a, b in free_ranges:
+            if a <= req_start and b >= req_end:
+                return (True, None)
+        return (False, None)
     except Exception as e:
         logging.error(f"❌ Błąd sprawdzania dostępności w kalendarzu: {e}")
         return (None, str(e))
+
+
+def _rfc3339_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.isoformat().replace("+00:00", "Z")
+
+# ---- Local time helpers (Europe/Warsaw) ----
+def _now_pl() -> datetime:
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Europe/Warsaw"))
+    except Exception:
+        pass
+    return datetime.now()
+
+def _now_pl_naive() -> datetime:
+    n = _now_pl()
+    # Use naive time for comparison with naive datetimes stored in state
+    return n.replace(tzinfo=None)
+
+def _is_past_date_iso(date_iso: str) -> bool:
+    try:
+        d = datetime.fromisoformat(date_iso).date()
+        return d < _now_pl().date()
+    except Exception:
+        return False
+
+def _is_past_datetime(date_iso: str, time_str: str) -> bool:
+    try:
+        dt = datetime.fromisoformat(f"{date_iso}T{time_str}")
+        return dt < _now_pl_naive()
+    except Exception:
+        return False
+
+def list_events_for_day(day: datetime):
+    try:
+        creds = get_google_credentials()
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        # Build day window in Europe/Warsaw and convert to UTC RFC3339
+        if ZoneInfo is not None:
+            tz = ZoneInfo("Europe/Warsaw")
+            day_start_local = day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
+            day_end_local = day.replace(hour=23, minute=59, second=59, microsecond=0, tzinfo=tz)
+            time_min = day_start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            time_max = day_end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            # Fallback: use naive -> UTC as-is (may shift by TZ)
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day.replace(hour=23, minute=59, second=59, microsecond=0)
+            time_min = _rfc3339_utc(day_start)
+            time_max = _rfc3339_utc(day_end)
+        res = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID or "primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+        return res.get("items", [])
+    except Exception as e:
+        logging.error(f"List events error: {e}")
+        return []
+
+def compute_free_ranges_for_day(day: datetime, duration_hours: int):
+    wh = OPENING_HOURS.get(day.weekday())
+    if not wh:
+        return []
+    open_h, close_h = wh
+    work_start = day.replace(hour=open_h, minute=0, second=0, microsecond=0)
+    work_end = day.replace(hour=close_h, minute=0, second=0, microsecond=0)
+    events = list_events_for_day(day)
+    busy = []
+    for ev in events:
+        s = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+        e = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date")
+        if not s or not e:
+            continue
+        try:
+            if "T" in s:
+                # Parse RFC3339 and convert to local Europe/Warsaw time
+                s_iso = s.replace("Z", "+00:00")
+                dt_s = datetime.fromisoformat(s_iso)
+                if dt_s.tzinfo is None and ZoneInfo is not None:
+                    dt_s = dt_s.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+                if ZoneInfo is not None:
+                    dt_s_local = dt_s.astimezone(ZoneInfo("Europe/Warsaw"))
+                else:
+                    dt_s_local = dt_s
+                st = day.replace(hour=dt_s_local.hour, minute=dt_s_local.minute, second=0, microsecond=0)
+            else:
+                st = work_start
+            if "T" in e:
+                e_iso = e.replace("Z", "+00:00")
+                dt_e = datetime.fromisoformat(e_iso)
+                if dt_e.tzinfo is None and ZoneInfo is not None:
+                    dt_e = dt_e.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+                if ZoneInfo is not None:
+                    dt_e_local = dt_e.astimezone(ZoneInfo("Europe/Warsaw"))
+                else:
+                    dt_e_local = dt_e
+                en = day.replace(hour=dt_e_local.hour, minute=dt_e_local.minute, second=0, microsecond=0)
+            else:
+                en = work_end
+        except Exception:
+            continue
+        st = max(st, work_start)
+        en = min(en, work_end)
+        if en > st:
+            busy.append((st, en))
+    busy.sort(key=lambda x: x[0])
+    merged = []
+    for iv in busy:
+        if not merged or iv[0] > merged[-1][1]:
+            merged.append(list(iv))
+        else:
+            merged[-1][1] = max(merged[-1][1], iv[1])
+    busy = [(a, b) for a, b in merged]
+    free = []
+    cursor = work_start
+    for a, b in busy:
+        if a > cursor:
+            free.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < work_end:
+        free.append((cursor, work_end))
+    need = timedelta(hours=_hours_to_float(duration_hours, default=2.0))
+    free = [iv for iv in free if (iv[1] - iv[0]) >= need]
+    return free
+
+def format_free_ranges(ranges, max_items=3):
+    out = []
+    for i, (a, b) in enumerate(ranges[:max_items], start=1):
+        out.append(f"{i}) {a.strftime('%H:%M')}–{b.strftime('%H:%M')}")
+    return ", ".join(out) if out else "brak"
 
 
 def send_message(recipient_id, text):
@@ -207,11 +456,13 @@ def send_quick_replies(recipient_id: str, text: str, replies: list[dict]):
     """Wyślij szybkie odpowiedzi (quick replies) na Instagramie/Messengerze."""
     url = f"https://graph.facebook.com/v23.0/me/messages"
     params = {"access_token": INSTAGRAM_TOKEN}
+    # sanitize titles in quick replies
+    clean_replies = list(replies or [])
     data = {
         "recipient": {"id": recipient_id},
         "message": {
             "text": text,
-            "quick_replies": replies,
+            "quick_replies": clean_replies,
         },
     }
     try:
@@ -225,14 +476,22 @@ def send_quick_replies(recipient_id: str, text: str, replies: list[dict]):
 
 # ---- [NOWE] Pomocnicze: routowanie FAQ vs rezerwacja ----
 def is_faq_query(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in [
+    """Heurystyka FAQ. Unika fałszywych trafień dla '2 godziny' (czas trwania).
+    Zwraca True tylko dla zapytań o FAQ (adres, godziny otwarcia, ceny itd.).
+    """
+    t = text.lower().strip()
+    # Jeśli wygląda na podanie czasu trwania (np. "2 godziny", "2h") – nie traktuj jak FAQ
+    if re.search(r"\b\d+\s*(?:h|godz|godzin|godziny)\b", t):
+        return False
+    # Frazy FAQ (bardziej precyzyjne, bez gołego 'godziny')
+    keywords = [
         "adres", "gdzie", "lokalizacja", "location",
         "cena", "ceny", "koszt", "ile koszt",
-        "godziny", "otwarcia", "kiedy otwarte",
+        "godziny otwarcia", "kiedy otwarte", "czy jest otwarte",
         "parking", "kontakt", "telefon", "mail", "email",
         "price", "prices", "open hours"
-    ])
+    ]
+    return any(k in t for k in keywords)
 
 def needs_reservation_input(active: dict | None) -> bool:
     """Czy trzeba kontynuować flow rezerwacji (brak danych lub czekamy na krok)?"""
@@ -244,6 +503,7 @@ def needs_reservation_input(active: dict | None) -> bool:
         or active.get("people") is None
         or active.get("date") is None
         or active.get("time") is None
+        or active.get("duration") is None
     )
 
 WEEKDAYS_PL = {
@@ -268,6 +528,14 @@ def extract_time(text: str):
     hh = int(m.group(1))
     mm = int(m.group(2)) if m.group(2) else 0
     return f"{hh:02d}:{mm:02d}:00"
+
+def parse_people_count(text: str) -> int | None:
+    """Parse number of people from user text. Accepts bare digits or with labels (osoby/osób/os)."""
+    t = text.lower()
+    m = re.search(r"\b(?:dla|na)?\s*(\d{1,2})\s*(?:osob(?:a|y)?|osób|os)?\b", t, re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(\d{1,2})\b", t)
+    return int(m.group(1)) if m else None
 
 def extract_weekday(text: str):
     for w in WEEKDAYS_PL:
@@ -450,7 +718,7 @@ def handle_reservation_step(sender_id, user_message):
         current["wizard_step"] = "date"
         current["updated_at"] = datetime.now().isoformat()
         table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
-        return "Za chwile dostaniesz serie pytan do rezerwacji. Najpierw podaj prosze date (np. 09.09 lub 9 wrzesnia)."
+        return "Za chwilę dostaniesz serię pytań do rezerwacji. Najpierw podaj proszę datę (np. 09.09 lub 9 września)."
 
     # [NOWE] Jeśli nie czekamy na potwierdzenie/wybór i użytkownik pyta o FAQ — nie pchaj rezerwacji
     if True:
@@ -459,7 +727,45 @@ def handle_reservation_step(sender_id, user_message):
 
     # Uzytkownik potwierdza tekstowo, finalnie potwierdza wlasciciel w Telegramie.
 
+    # Jesli kreator jest na kroku 'duration', najpierw sprawdz dostępność w Google Calendar, zanim poprosisz o potwierdzenie.
+    try:
+        if current.get("wizard") and current.get("wizard_step") == "duration" and not current.get("awaiting_confirmation"):
+            dur_try = parse_duration_hours(txt)
+            if dur_try:
+                current["duration"] = dur_try
+                full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
+                is_free, err = check_availability_in_calendar(full_dt, duration_hours=dur_try)
+                if is_free is None:
+                    return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
+                if not is_free:
+                    # proponuj wolne okna i wróć do wyboru godziny
+                    current["awaiting_confirmation"] = False
+                    current["wizard_step"] = "time"
+                    current["updated_at"] = datetime.now().isoformat()
+                    table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                    free_ranges = compute_free_ranges_for_day(full_dt, dur_try)
+                    opts = format_free_ranges(free_ranges, max_items=3)
+                    return f"Ten termin jest zajety. Dostepne przedzialy tego dnia (min {dur_try}h): {opts}. Podaj prosze inna godzine z powyzszych lub inny dzien."
+                # wolne -> pros o potwierdzenie
+                current["wizard_step"] = "confirm"
+                current["awaiting_confirmation"] = True
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                human_dt = full_dt.strftime("%d.%m.%Y %H:%M")
+                return f"Prosze o potwierdzenie: zarezerwowac warsztat dla {current['people']} osob na {dur_try} godz. w dniu {human_dt}? Odpowiedz 'Tak', aby przejsc dalej."
+    except Exception:
+        pass
 
+    # Jeśli mamy juz date, godzine i osoby, ale brak czasu trwania -> zapytaj o duration
+    try:
+        if (
+            current.get("date") and current.get("time") and current.get("people")
+            and not current.get("duration") and not current.get("awaiting_day_choice")
+            and not current.get("awaiting_confirmation")
+        ):
+            return "Na ile godzin chcesz zarezerwowac? Rekomendujemy 2 godziny. Napisz np. '2 godziny'."
+    except Exception:
+        pass
 
     # Wizard mode: sequential questions date -> time -> people -> confirm
     if current.get("wizard"):
@@ -470,7 +776,7 @@ def handle_reservation_step(sender_id, user_message):
             table.delete_item(Key={"user_id": sender_id, "reservation_id": "current"})
             return "Anulowano rezerwacje. Napisz, gdy bedziesz gotowy."
         if any(k in txt for k in ["wstecz", "cofnij", "back"]):
-            order = ["date", "time", "people", "confirm"]
+            order = ["date", "time", "people", "duration", "confirm"]
             if step in order:
                 i = order.index(step)
                 step = order[max(0, i-1)]
@@ -487,46 +793,85 @@ def handle_reservation_step(sender_id, user_message):
                 if quick:
                     nd = quick
             if nd:
+                # Reject past dates
+                if _is_past_date_iso(nd):
+                    current["awaiting_day_choice"] = True
+                    current["wizard_step"] = "date"
+                    # suggest 2–3 upcoming days
+                    opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                    current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+                    current["updated_at"] = datetime.now().isoformat()
+                    table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                    msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+                    return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
                 current["date"] = nd
                 current["wizard_step"] = "time"
                 current["updated_at"] = datetime.now().isoformat()
                 table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
-                return "Dzieki! Podaj prosze godzine (np. 17:00)."
+                return "Dzięki! Podaj proszę godzinę (np. 17:00)."
             else:
-                return "Podaj prosze konkretna date (np. 09.09 lub 9 wrzesnia)."
+                return "Podaj proszę konkretną datę (np. 09.09 lub 9 września)."
 
         if step == "time":
             tm = extract_time(txt)
             if tm:
+                # If date already chosen, ensure combined datetime is not in the past
+                if current.get("date") and _is_past_datetime(current["date"], tm):
+                    # Keep date, just ask for a future time
+                    current["time"] = None
+                    current["wizard_step"] = "time"
+                    current["updated_at"] = datetime.now().isoformat()
+                    table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                    return "Ta godzina już minęła. Podaj proszę przyszłą godzinę (np. 17:00)."
                 current["time"] = tm
                 current["wizard_step"] = "people"
                 current["updated_at"] = datetime.now().isoformat()
                 table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
-                return "Ile osob ma wziac udzial? (np. 'dla 2 osob' lub '2 osoby')."
+                return "Ile osób ma wziąć udział? (np. 'dla 2 osób' lub '2 osoby')."
             else:
-                return "Podaj prosze godzine rezerwacji (np. 17:00)."
+                return "Podaj proszę godzinę rezerwacji (np. 17:00)."
 
         if step == "people":
-            new_p = None
-            m1 = re.search(r"\b(?:dla|na)\s*(\d{1,2})\s*(?:osob|osoby|osoba|os)?\b", txt, re.IGNORECASE)
-            if m1:
-                new_p = int(m1.group(1))
-            else:
-                m2 = re.search(r"\b(\d{1,2})\s*(?:osob|osoby|osoba|os)\b", txt, re.IGNORECASE)
-                if m2:
-                    new_p = int(m2.group(1))
+            new_p = parse_people_count(txt)
             if new_p:
                 current["people"] = new_p
                 current["details"] = f"Warsztat dla {new_p} osob"
+                # Ask for duration next
+                current["wizard_step"] = "duration"
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                return "Na ile godzin chcesz zarezerwowac zajecia? Dla jednego zdjęcia rekomendujemy 2 godziny. Wpisz proszę ilość godzin (np. '2 godziny' lub samo '2')."
+            else:
+                return "Podaj proszę liczbę osób (np. 'dla 2 osób' lub '2 osoby')."
+
+        if step == "duration":
+            dur = parse_duration_hours(txt)
+            if dur:
+                # Ustal czas trwania i sprawdź dostępność w Google Calendar zanim poprosisz o potwierdzenie
+                current["duration"] = dur
+                full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
+                is_free, err = check_availability_in_calendar(full_dt, duration_hours=dur)
+                if is_free is None:
+                    return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
+                if not is_free:
+                    # Nie ustawiaj trybu potwierdzenia – poproś o inną godzinę/dzień i pokaż wolne przedziały
+                    current["awaiting_confirmation"] = False
+                    current["wizard_step"] = "time"
+                    current["updated_at"] = datetime.now().isoformat()
+                    table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                    free_ranges = compute_free_ranges_for_day(full_dt, dur)
+                    opts = format_free_ranges(free_ranges, max_items=3)
+                    return f"Ten termin jest zajęty. Dostępne przedziały tego dnia (min {dur}h): {opts}. Podaj proszę inną godzinę z powyższych lub inny dzień."
+
+                # Wolne – teraz dopiero prosimy o potwierdzenie
                 current["wizard_step"] = "confirm"
                 current["awaiting_confirmation"] = True
                 current["updated_at"] = datetime.now().isoformat()
                 table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
-                full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
                 human_dt = full_dt.strftime("%d.%m.%Y %H:%M")
-                return f"Prosze o potwierdzenie: zarezerwowac warsztat dla {new_p} osob w dniu {human_dt}? Odpowiedz 'tak' aby przejsc dalej."
+                return f"Proszę o potwierdzenie: zarezerwować warsztat dla {current['people']} osób na {dur} godz. w dniu {human_dt}? Odpowiedz 'tak', aby przejść dalej."
             else:
-                return "Podaj prosze liczbe osob (np. 'dla 2 osob' lub '2 osoby')."
+                return "Podaj proszę czas trwania w godzinach (np. 2). Rekomendujemy 2 godziny."
 
         if step == "confirm":
             # allow on-the-fly corrections of date/time/people
@@ -545,15 +890,42 @@ def handle_reservation_step(sender_id, user_message):
                     nd = quick
             if nd and nd != current.get("date"):
                 current["date"] = nd; corrected = True
-            m1 = re.search(r"\b(?:dla|na)\s*(\d{1,2})\s*(?:osob|osoby|osoba|os)?\b", txt, re.IGNORECASE)
-            m2 = re.search(r"\b(\d{1,2})\s*(?:osob|osoby|osoba|os)\b", txt, re.IGNORECASE) if not m1 else None
-            nppl = int(m1.group(1)) if m1 else (int(m2.group(1)) if m2 else None)
+            nppl = parse_people_count(txt)
             if nppl and nppl != current.get("people"):
                 current["people"] = nppl; current["details"] = f"Warsztat dla {nppl} osob"; corrected = True
             if corrected:
                 current["updated_at"] = datetime.now().isoformat()
                 table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
                 full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
+                # Ponownie sprawdź dostępność po korekcie
+                dur2 = current.get("duration") or 2
+                is_free, err = check_availability_in_calendar(full_dt, duration_hours=dur2)
+                if is_free is None:
+                    return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
+                if not is_free:
+                    free_ranges = compute_free_ranges_for_day(full_dt, dur2)
+                    current["awaiting_confirmation"] = False
+                    if free_ranges:
+                        # Ten sam dzień ma okna -> wyczyść godzinę i poproś o inną
+                        current["wizard_step"] = "time"
+                        current["time"] = None
+                        current["awaiting_day_choice"] = False
+                        current["updated_at"] = datetime.now().isoformat()
+                        table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                        opts = format_free_ranges(free_ranges, max_items=3)
+                        return f"Ten termin jest zajęty. Dostępne przedziały tego dnia (min {dur2}h): {opts}. Podaj proszę inną godzinę z powyższych lub inny dzień."
+                    else:
+                        # Brak okien tego dnia -> poproś o inny dzień
+                        current["wizard_step"] = "date"
+                        current["time"] = None
+                        current["date"] = None
+                        current["awaiting_day_choice"] = True
+                        opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                        current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+                        current["updated_at"] = datetime.now().isoformat()
+                        table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                        msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+                        return f"Ten termin jest zajęty i brak wolnych okien tego dnia. {msg} Odpowiedz 1, 2 lub 3 albo wpisz konkretną datę."
                 human_dt = full_dt.strftime("%d.%m.%Y %H:%M")
                 return f"Zaktualizowalem szczegoly. Potwierdzic rezerwacje dla {current['people']} osob w dniu {human_dt}? Odpowiedz 'tak'."
             # else: fall-through to the usual 'tak' handling below
@@ -561,14 +933,57 @@ def handle_reservation_step(sender_id, user_message):
     # --- 1) Krótkie potwierdzenie „tak/ok” ---
     if current.get("awaiting_confirmation") and txt in {"tak", "ok", "okej", "potwierdzam", "potwierdz", "potwierdź", "zgoda", "tak.", "ok.", "ok", "yes", "y", "👍", "✅"}:
         full_date = datetime.fromisoformat(current["date"] + "T" + current["time"])
-        is_free, err = check_availability_in_calendar(full_date)
+        _dur = current.get("duration") or 2
+        # Past guard on confirmation
+        if full_date < _now_pl_naive():
+            free_ranges = compute_free_ranges_for_day(full_date, _dur)
+            current["awaiting_confirmation"] = False
+            if full_date.date() == _now_pl_naive().date() and free_ranges:
+                current["wizard_step"] = "time"
+                current["time"] = None
+                current["awaiting_day_choice"] = False
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                opts = format_free_ranges(free_ranges, max_items=3)
+                return f"Nie można rezerwować terminu z przeszłości. Dostępne dzisiaj (min {_dur}h): {opts}. Podaj proszę inną godzinę lub inny dzień."
+            else:
+                current["wizard_step"] = "date"
+                current["time"] = None
+                current["date"] = None
+                current["awaiting_day_choice"] = True
+                opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+                return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
+        is_free, err = check_availability_in_calendar(full_date, duration_hours=_dur)
         if is_free is None:
             return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
         if not is_free:
+            free_ranges = compute_free_ranges_for_day(full_date, _dur)
             current["awaiting_confirmation"] = False
-            current["updated_at"] = datetime.now().isoformat()
-            table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
-            return "❌ Ten termin już jest zajęty. Podaj proszę inny dzień lub godzinę."
+            if free_ranges:
+                # Ten sam dzień: wyczyść godzinę i poproś o inną
+                current["wizard_step"] = "time"
+                current["time"] = None
+                current["awaiting_day_choice"] = False
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                opts = format_free_ranges(free_ranges, max_items=3)
+                return f"Ten termin jest zajety. Dostepne przedzialy tego dnia (min {_dur}h): {opts}. Podaj prosze inna godzine z powyzszych lub inny dzien."
+            else:
+                # Brak okien tego dnia: poproś o inny dzień i zaproponuj 2–3
+                current["wizard_step"] = "date"
+                current["time"] = None
+                current["date"] = None
+                current["awaiting_day_choice"] = True
+                opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+                current["updated_at"] = datetime.now().isoformat()
+                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+                return f"Ten termin jest zajety i brak wolnych okien tego dnia. {msg} Odpowiedz 1, 2 lub 3 albo wpisz konkretną datę."
 
         # zapis pending + powiadomienie
         pending = save_reservation(sender_id, {
@@ -581,7 +996,12 @@ def handle_reservation_step(sender_id, user_message):
         if pending:
             threading.Thread(
                 target=send_telegram_notification_sync,
-                args=(pending["reservation_id"], sender_id, pending["details"], pending["date"])
+                args=(
+                    pending["reservation_id"],
+                    sender_id,
+                    f"{pending.get('details')} • {pending.get('people')} os • {pending.get('duration')} h",
+                    pending["date"],
+                )
             ).start()
             current["awaiting_confirmation"] = False
             current["updated_at"] = datetime.now().isoformat()
@@ -600,6 +1020,13 @@ def handle_reservation_step(sender_id, user_message):
         }
         if txt in idx_map and idx_map[txt] < len(current["suggested_options"]):
             chosen_iso = current["suggested_options"][idx_map[txt]]
+            # Past date guard
+            if _is_past_date_iso(chosen_iso):
+                # keep awaiting_day_choice and re-present options
+                opts_dt = [datetime.fromisoformat(o + "T00:00:00") for o in current["suggested_options"]]
+                msg = format_options_message(opts_dt, time_hint=(current["time"][:5] if current.get("time") else None),
+                                             people_hint=current.get("people"))
+                return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
             current["date"] = chosen_iso
             current["awaiting_day_choice"] = False
             current["suggested_options"] = []
@@ -607,13 +1034,24 @@ def handle_reservation_step(sender_id, user_message):
             # pozwól też na wpisanie pełnej daty lub nazwy dnia (nadpisze wybór)
             d = extract_concrete_date(txt)
             if d:
+                if _is_past_date_iso(d):
+                    opts_dt = [datetime.fromisoformat(o + "T00:00:00") for o in current["suggested_options"]]
+                    msg = format_options_message(opts_dt, time_hint=(current["time"][:5] if current.get("time") else None),
+                                                 people_hint=current.get("people"))
+                    return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
                 current["date"] = d
                 current["awaiting_day_choice"] = False
                 current["suggested_options"] = []
             else:
                 wd = extract_weekday(txt)
                 if wd is not None:
-                    current["date"] = resolve_weekday_to_date(wd)
+                    nd2 = resolve_weekday_to_date(wd)
+                    if _is_past_date_iso(nd2):
+                        opts_dt = [datetime.fromisoformat(o + "T00:00:00") for o in current["suggested_options"]]
+                        msg = format_options_message(opts_dt, time_hint=(current["time"][:5] if current.get("time") else None),
+                                                     people_hint=current.get("people"))
+                        return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
+                    current["date"] = nd2
                     current["awaiting_day_choice"] = False
                     current["suggested_options"] = []
                 else:
@@ -649,12 +1087,32 @@ def handle_reservation_step(sender_id, user_message):
             # konkretna data
             d = extract_concrete_date(txt)
             if d:
+                if _is_past_date_iso(d):
+                    # propose options and keep asking for future date
+                    opts = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                    current["awaiting_day_choice"] = True
+                    current["suggested_options"] = [o.date().isoformat() for o in opts]
+                    current["updated_at"] = datetime.now().isoformat()
+                    table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                    msg = format_options_message(opts, time_hint=(current["time"][:5] if current.get("time") else None),
+                                                 people_hint=current.get("people"))
+                    return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
                 current["date"] = d
             else:
                 # nazwa dnia tygodnia
                 wd = extract_weekday(txt)
                 if wd is not None:
-                    current["date"] = resolve_weekday_to_date(wd)
+                    nd3 = resolve_weekday_to_date(wd)
+                    if _is_past_date_iso(nd3):
+                        opts = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+                        current["awaiting_day_choice"] = True
+                        current["suggested_options"] = [o.date().isoformat() for o in opts]
+                        current["updated_at"] = datetime.now().isoformat()
+                        table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+                        msg = format_options_message(opts, time_hint=(current["time"][:5] if current.get("time") else None),
+                                                     people_hint=current.get("people"))
+                        return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
+                    current["date"] = nd3
                 else:
                     # ogólnik → zaproponuj 2–3 opcje i zapamiętaj je
                     if is_vague_date_phrase(txt):
@@ -696,9 +1154,34 @@ def handle_reservation_step(sender_id, user_message):
     if not current["time"]:
         return "Proszę podać godzinę rezerwacji (np. „18:00”)."
 
-    # --- 5) Mamy komplet → sprawdź dostępność i poproś o potwierdzenie ---
+    # --- 5) Mamy komplet → najpierw walidacja przyszłości, potem sprawdź dostępność i poproś o potwierdzenie ---
     full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
-    is_free, err = check_availability_in_calendar(full_dt)
+    _dur2 = current.get("duration") or 2
+    # Guard: do not allow booking in the past
+    if full_dt < _now_pl_naive():
+        free_ranges = compute_free_ranges_for_day(full_dt, _dur2)
+        if full_dt.date() == _now_pl_naive().date() and free_ranges:
+            current["awaiting_confirmation"] = False
+            current["wizard_step"] = "time"
+            current["time"] = None
+            current["awaiting_day_choice"] = False
+            current["updated_at"] = datetime.now().isoformat()
+            table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+            opts = format_free_ranges(free_ranges, max_items=3)
+            return f"Nie można rezerwować terminu z przeszłości. Dostępne dzisiaj (min {_dur2}h): {opts}. Podaj proszę inną godzinę lub inny dzień."
+        else:
+            current["awaiting_confirmation"] = False
+            current["wizard_step"] = "date"
+            current["time"] = None
+            current["date"] = None
+            current["awaiting_day_choice"] = True
+            opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+            current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+            current["updated_at"] = datetime.now().isoformat()
+            table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+            msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+            return f"Nie można rezerwować terminu z przeszłości. {msg} Odpowiedz 1, 2 lub 3 albo wpisz przyszłą datę."
+    is_free, err = check_availability_in_calendar(full_dt, duration_hours=_dur2)
     if is_free is None:
         return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
     if is_free:
@@ -710,7 +1193,29 @@ def handle_reservation_step(sender_id, user_message):
         table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
         return f"Proszę o potwierdzenie: zarezerwować warsztat dla {current['people']} osób w dniu {human_dt}? Odpowiedz „tak”, aby przejść dalej."
     else:
-        return "❌ Ten termin jest zajęty. Podaj proszę inny dzień lub godzinę."
+        # Termin zajęty: zaproponuj inne godziny tego dnia lub inne dni i utrzymaj flow
+        free_ranges = compute_free_ranges_for_day(full_dt, _dur2)
+        if free_ranges:
+            current["awaiting_confirmation"] = False
+            current["wizard_step"] = "time"
+            current["time"] = None
+            current["awaiting_day_choice"] = False
+            current["updated_at"] = datetime.now().isoformat()
+            table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+            opts = format_free_ranges(free_ranges, max_items=3)
+            return f"Ten termin jest zajety. Dostepne przedzialy tego dnia (min {_dur2}h): {opts}. Podaj prosze inna godzine z powyzszych lub inny dzien."
+        else:
+            current["awaiting_confirmation"] = False
+            current["wizard_step"] = "date"
+            current["time"] = None
+            current["date"] = None
+            current["awaiting_day_choice"] = True
+            opts_days = suggest_day_options(datetime.now(), how_many=3, prefer_next_week=False)
+            current["suggested_options"] = [o.date().isoformat() for o in opts_days]
+            current["updated_at"] = datetime.now().isoformat()
+            table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **current})
+            msg = format_options_message(opts_days, time_hint=None, people_hint=current.get("people"))
+            return f"Ten termin jest zajety i brak wolnych okien tego dnia. {msg} Odpowiedz 1, 2 lub 3 albo wpisz konkretną datę."
 
 
 async def send_telegram_reservation_notification(reservation_id, user_id, reservation_details, date):
@@ -768,8 +1273,10 @@ async def handle_telegram_callback(update, context):
                 Item={
                     "user_id": user_id,
                     "reservation_id": new_id,
-                    "details": current["details"],
+                    "details": current.get("user_name") or current.get("details") or f"Klient {user_id}",
                     "date": full_date.isoformat(),
+                    "people": current.get("people"),
+                    "duration": current.get("duration") or 2,
                     "status": "confirmed",
                     "reminded": False,
                 }
@@ -781,7 +1288,13 @@ async def handle_telegram_callback(update, context):
             )
 
             # dodaj do Google Calendar
-            add_to_google_calendar(current["details"], full_date, user_id)
+            add_to_google_calendar(
+                details=current.get("user_name") or current.get("details") or f"Klient {user_id}",
+                date=full_date,
+                user_id=user_id,
+                people=current.get("people"),
+                duration_hours=current.get("duration") or 2,
+            )
 
             # wyślij potwierdzenie do klienta
             send_message(user_id, f"✅ Twoja rezerwacja została potwierdzona. Zapraszamy w dniu {full_date.strftime('%d.%m.%Y %H:%M')}")
@@ -850,13 +1363,30 @@ def save_reservation(user_id, reservation_data, status="pending"):
         reservation_id = str(datetime.now().timestamp())
         full_date = datetime.fromisoformat(reservation_data["date"] + "T" + reservation_data["time"])
 
+        # Enrich missing fields from current state
+        try:
+            cur = table.get_item(Key={"user_id": user_id, "reservation_id": "current"}).get("Item")
+        except Exception:
+            cur = None
+
+        people = reservation_data.get("people") or (cur.get("people") if cur else None)
+        duration = reservation_data.get("duration") or (cur.get("duration") if cur else 2)
+        user_name = reservation_data.get("user_name") or (cur.get("user_name") if cur else None)
+        details = reservation_data.get("details")
+        if not details:
+            # prefer display name
+            details = user_name or get_user_display_name(user_id) or f"Klient {user_id}"
+
         # Zapisz do DynamoDB
         table.put_item(
             Item={
                 "user_id": user_id,
                 "reservation_id": reservation_id,
-                "details": reservation_data["details"],
+                "details": details,
                 "date": full_date.isoformat(),
+                "people": people,
+                "duration": duration,
+                "user_name": user_name or details,
                 "status": status,
                 "reminded": False,
             }
@@ -864,8 +1394,10 @@ def save_reservation(user_id, reservation_data, status="pending"):
 
         return {
             "reservation_id": reservation_id,
-            "details": reservation_data["details"],
+            "details": details,
             "date": full_date,
+            "people": people,
+            "duration": duration,
             "status": status,
         }
 
@@ -892,7 +1424,7 @@ def confirm_current_reservation(user_id: str) -> str:
     except Exception:
         return "Nieprawidlowy format daty/godziny. Podaj prosze ponownie."
 
-    is_free, err = check_availability_in_calendar(full_date)
+    is_free, err = check_availability_in_calendar(full_date, duration_hours=(current.get("duration") or 2))
     if is_free is None:
         return "Nie udalo sie sprawdzic dostepnosci. Sprobuj ponownie pozniej."
     if not is_free:
@@ -935,22 +1467,28 @@ def update_reservation_status(reservation_id, user_id, new_status):
         logging.error(e)
 
 async def setup_telegram_bot():
-    """Setup Telegram bot handlers and return Application"""
+    """Setup Telegram bot handlers and return Application (without starting)."""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CallbackQueryHandler(handle_telegram_callback))
-    await application.initialize()
-    await application.start()
     return application
 
 def _telegram_loop_runner():
+    """Run Telegram bot polling in a dedicated event loop/thread."""
     global TELEGRAM_APP, TELEGRAM_LOOP
     loop = asyncio.new_event_loop()
     TELEGRAM_LOOP = loop
     asyncio.set_event_loop(loop)
     try:
+        # Build application and start polling
         app = loop.run_until_complete(setup_telegram_bot())
         TELEGRAM_APP = app
-        loop.run_forever()
+        # Ensure webhook is disabled before polling
+        try:
+            loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
+        except Exception:
+            pass
+        # Run polling (blocks until stop is called)
+        loop.run_until_complete(app.run_polling())
     finally:
         try:
             if TELEGRAM_APP is not None:
@@ -1118,6 +1656,22 @@ def webhook():
                             active["updated_at"] = datetime.now().isoformat()
                             table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **active})
                             full_dt = datetime.fromisoformat(active["date"] + "T" + active["time"])
+                            # Sprawdź dostępność w Google Calendar przed ponownym proszeniem o potwierdzenie
+                            dur3 = active.get("duration") or 2
+                            is_free, err = check_availability_in_calendar(full_dt, duration_hours=dur3)
+                            if is_free is None:
+                                send_message(sender_id, "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę.")
+                                continue
+                            if not is_free:
+                                # Zaproponuj okna czasowe i wróć do wyboru godziny
+                                active["awaiting_confirmation"] = False
+                                active["wizard_step"] = "time"
+                                active["updated_at"] = datetime.now().isoformat()
+                                table.put_item(Item={"user_id": sender_id, "reservation_id": "current", **active})
+                                free_ranges = compute_free_ranges_for_day(full_dt, dur3)
+                                opts = format_free_ranges(free_ranges, max_items=3)
+                                send_message(sender_id, f"Ten termin jest zajęty. Dostępne przedziały tego dnia (min {dur3}h): {opts}. Podaj proszę inną godzinę z powyższych lub inny dzień.")
+                                continue
                             human_dt = full_dt.strftime("%d.%m.%Y %H:%M")
                             try:
                                 quicks = [
@@ -1204,6 +1758,50 @@ def admin_clear_cache():
     except Exception as e:
         logging.error(f'Admin clear_cache error: {e}', exc_info=True)
         return 'ERROR', 500
+
+
+# ---- Admin: Test Google Calendar insert ----
+@app.route('/admin/test_calendar_insert', methods=['GET', 'POST'])
+def admin_test_calendar_insert():
+    token = request.args.get('token') or request.headers.get('X-Admin-Token')
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return 'Forbidden', 403
+
+    # Params
+    q_date = request.args.get('date')  # e.g., 2025-09-10 or 10.09.2025
+    q_time = request.args.get('time', '10:00')  # e.g., 16:00
+    details = request.args.get('details', 'Test reservation')
+    duration = int(request.args.get('duration', '2'))
+    user_id = request.args.get('user_id', 'admin-test')
+
+    # Build datetime (naively, Europe/Warsaw provided in event)
+    if q_date:
+        dt = parse_date(f"{q_date} {q_time}")
+    else:
+        now = datetime.now()
+        dt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
+    if not dt:
+        return 'Invalid date/time', 400
+
+    try:
+        # Locally reuse add_to_google_calendar with provided duration
+        creds = get_google_credentials()
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        event = {
+            "summary": details,
+            "description": f"Rezerwacja testowa od {user_id}",
+            "start": {"dateTime": dt.isoformat(), "timeZone": "Europe/Warsaw"},
+            "end": {"dateTime": (dt + timedelta(hours=duration)).isoformat(), "timeZone": "Europe/Warsaw"},
+        }
+        calendar_id = os.getenv('GOOGLE_CALENDAR_ID', 'primary')
+        result = service.events().insert(calendarId=calendar_id, body=event).execute()
+        link = result.get('htmlLink')
+        logging.info(f"Test insert OK (calendarId={calendar_id}): {link}")
+        return f"OK: inserted event at {dt.strftime('%Y-%m-%d %H:%M')} (calendarId={calendar_id}) -> {link}", 200
+    except Exception as e:
+        logging.error(f"Test insert ERROR: {e}", exc_info=True)
+        return f"ERROR: {e}", 500
 
 
 
