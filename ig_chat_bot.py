@@ -1244,6 +1244,16 @@ def webhook():
 
                     # When awaiting confirmation, small in-message corrections
                     active = _load_current(sender_id)
+
+                    # Commands available in chat
+                    cmd = (user_message or '').strip().lower()
+                    if cmd == '/clear':
+                        try:
+                            table.delete_item(Key={"user_id": sender_id, "reservation_id": "current"})
+                        except Exception:
+                            pass
+                        send_message(sender_id, "Wyczyszczono rozmowę i dane rezerwacji. Napisz, w czym mogę pomóc?")
+                        continue
                     if active.get("awaiting_confirmation"):
                         corrected = False
                         # AI try to extract quick corrections
@@ -1317,75 +1327,6 @@ def webhook():
             return 'ERROR', 500
 
         return 'OK', 200
-
-
-# -----------------------------
-# Admin helpers
-# -----------------------------
-@app.route('/admin/clear_cache', methods=['POST', 'GET'])
-def admin_clear_cache():
-    token = request.args.get('token') or request.headers.get('X-Admin-Token')
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        return 'Forbidden', 403
-    user_id = request.args.get('user_id')
-    if not user_id:
-        return 'Missing user_id', 400
-    try:
-        table.delete_item(Key={"user_id": user_id, "reservation_id": "current"})
-        return 'OK', 200
-    except Exception as e:
-        logging.error(f'Admin clear_cache error: {e}', exc_info=True)
-        return 'ERROR', 500
-
-
-# -----------------------------
-# Admin diagnostics
-# -----------------------------
-@app.route('/admin/diagnose', methods=['GET'])
-def admin_diagnose():
-    token = request.args.get('token') or request.headers.get('X-Admin-Token')
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-        return 'Forbidden', 403
-
-    info = {
-        "time_utc": datetime.utcnow().isoformat() + "Z",
-        "port_env": os.environ.get('PORT'),
-        "openai_key_last6": (OPENAI_API_KEY[-6:] if OPENAI_API_KEY else None),
-    }
-
-    # DNS resolution for api.openai.com
-    try:
-        addrs = socket.getaddrinfo('api.openai.com', 443, proto=socket.IPPROTO_TCP)
-        uniq = []
-        seen = set()
-        for family, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            key = (family, ip)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append({
-                'family': 'IPv6' if family == socket.AF_INET6 else 'IPv4',
-                'ip': ip,
-            })
-        info["dns"] = {"resolved": True, "addresses": uniq}
-    except Exception as e:
-        info["dns"] = {"resolved": False, "error": str(e)}
-
-    # Quick OpenAI API check
-    status = 200
-    try:
-        c = client.with_options(timeout=5.0)
-        models = c.models.list()
-        info["openai"] = {
-            "ok": True,
-            "models_count": len(getattr(models, 'data', []) or []),
-        }
-    except Exception as e:
-        info["openai"] = {"ok": False, "error": str(e)}
-        status = 500
-
-    return jsonify(info), status
 
 # -----------------------------
 # Entrypoint
