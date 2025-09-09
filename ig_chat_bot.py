@@ -16,7 +16,7 @@ except Exception:
 import requests
 import boto3
 from botocore.exceptions import ClientError
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from dateparser import parse as parse_date
@@ -28,6 +28,7 @@ from google.oauth2.service_account import Credentials
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler
 import asyncio
+import socket
 
 # -----------------------------
 # App / Config
@@ -1082,14 +1083,27 @@ def _telegram_loop_runner():
     try:
         app_ = loop.run_until_complete(setup_telegram_bot())
         TELEGRAM_APP = app_
+        # Ensure no Telegram webhook is set (we use polling here)
         try:
             loop.run_until_complete(app_.bot.delete_webhook(drop_pending_updates=True))
         except Exception:
             pass
-        loop.run_until_complete(app_.run_polling())
+
+        # Start Application without installing signal handlers (we're in a thread)
+        loop.run_until_complete(app_.initialize())
+        loop.run_until_complete(app_.start())
+        loop.run_until_complete(app_.updater.start_polling())
+
+        # Keep the thread's loop running
+        loop.run_forever()
     finally:
         try:
             if TELEGRAM_APP is not None:
+                # Graceful shutdown sequence
+                try:
+                    loop.run_until_complete(TELEGRAM_APP.updater.stop())
+                except Exception:
+                    pass
                 loop.run_until_complete(TELEGRAM_APP.stop())
                 loop.run_until_complete(TELEGRAM_APP.shutdown())
         except Exception:
@@ -1323,6 +1337,55 @@ def admin_clear_cache():
         logging.error(f'Admin clear_cache error: {e}', exc_info=True)
         return 'ERROR', 500
 
+
+# -----------------------------
+# Admin diagnostics
+# -----------------------------
+@app.route('/admin/diagnose', methods=['GET'])
+def admin_diagnose():
+    token = request.args.get('token') or request.headers.get('X-Admin-Token')
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return 'Forbidden', 403
+
+    info = {
+        "time_utc": datetime.utcnow().isoformat() + "Z",
+        "port_env": os.environ.get('PORT'),
+        "openai_key_last6": (OPENAI_API_KEY[-6:] if OPENAI_API_KEY else None),
+    }
+
+    # DNS resolution for api.openai.com
+    try:
+        addrs = socket.getaddrinfo('api.openai.com', 443, proto=socket.IPPROTO_TCP)
+        uniq = []
+        seen = set()
+        for family, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            key = (family, ip)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append({
+                'family': 'IPv6' if family == socket.AF_INET6 else 'IPv4',
+                'ip': ip,
+            })
+        info["dns"] = {"resolved": True, "addresses": uniq}
+    except Exception as e:
+        info["dns"] = {"resolved": False, "error": str(e)}
+
+    # Quick OpenAI API check
+    status = 200
+    try:
+        c = client.with_options(timeout=5.0)
+        models = c.models.list()
+        info["openai"] = {
+            "ok": True,
+            "models_count": len(getattr(models, 'data', []) or []),
+        }
+    except Exception as e:
+        info["openai"] = {"ok": False, "error": str(e)}
+        status = 500
+
+    return jsonify(info), status
 
 # -----------------------------
 # Entrypoint
