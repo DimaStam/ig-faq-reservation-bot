@@ -7,7 +7,7 @@ import threading
 import time
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple, Lists
+from typing import Optional, Dict, Any, Tuple, List
 try:
     from zoneinfo import ZoneInfo
 except Exception:
