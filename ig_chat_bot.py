@@ -42,7 +42,7 @@ INSTAGRAM_TOKEN = os.getenv("INSTAGRAM_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("OWNER_TELEGRAM_CHAT_ID")
+OWNER_CHAT_ID = (os.getenv("OWNER_TELEGRAM_CHAT_ID") or "").strip() or None
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
