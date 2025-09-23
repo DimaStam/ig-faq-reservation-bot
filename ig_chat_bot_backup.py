@@ -397,22 +397,27 @@ VAGUE_PHRASES = [
     "w tym miesiacu",
 ]
 
-WEEKDAY_VARIANTS_PL: List[Tuple[str, Tuple[str, ...]]] = [
-    ("Poniedziałek", ("poniedziałek", "poniedzialek", "pon")),
-    ("Wtorek", ("wtorek", "wt", "wto")),
-    ("Środa", ("środa", "sroda", "śr", "sr")),
-    ("Czwartek", ("czwartek", "czw")),
-    ("Piątek", ("piątek", "piatek", "pt")),
-    ("Sobota", ("sobota", "sob")),
-    ("Niedziela", ("niedziela", "nd", "nie")),
-]
-
-WEEKDAY_NAMES_PL = [name for name, _ in WEEKDAY_VARIANTS_PL]
-
-WEEKDAYS_PL: Dict[str, int] = {}
-for idx, (display_name, variants) in enumerate(WEEKDAY_VARIANTS_PL):
-    for variant in [display_name.lower(), *variants]:
-        WEEKDAYS_PL[variant] = idx
+WEEKDAYS_PL = {
+    "poniedziałek": 0,
+    "pon": 0,
+    "wtorek": 1,
+    "wt": 1,
+    "wto": 1,
+    "środa": 2,
+    "sroda": 2,
+    "śr": 2,
+    "sr": 2,
+    "czwartek": 3,
+    "czw": 3,
+    "piątek": 4,
+    "piatek": 4,
+    "pt": 4,
+    "sobota": 5,
+    "sob": 5,
+    "niedziela": 6,
+    "nd": 6,
+    "nie": 6,
+}
 
 
 def is_vague_date_phrase(t: str) -> bool:
@@ -701,7 +706,7 @@ def is_faq_query(text: str) -> bool:
 
 
 def _format_options_message(options: List[datetime], time_hint: Optional[str] = None, people_hint: Optional[int] = None) -> str:
-    labels = [f"{WEEKDAY_NAMES_PL[dt.weekday()]} {dt.strftime('%d.%m')}" for dt in options]
+    labels = [dt.strftime("%A %d.%m").capitalize() for dt in options]
     joined = " lub ".join(labels)
     suffix = ""
     if time_hint:
@@ -802,22 +807,10 @@ def handle_reservation_step(sender_id: str, user_message: str) -> str:
     # Date resolution
     new_date_iso: Optional[str] = None
     if ai.get("raw_date"):
-        raw_date_val = ai.get("raw_date")
         # try to build ISO date from AI raw
-        d = extract_concrete_date_fallback(raw_date_val)
+        d = extract_concrete_date_fallback(ai.get("raw_date"))
         if d:
             new_date_iso = d
-        else:
-            # fallback: interpret weekday-only input as the next occurrence
-            normalized_weekday = normalize_text(raw_date_val)
-            weekday_idx = WEEKDAYS_PL.get(normalized_weekday)
-            if weekday_idx is None and normalized_weekday:
-                for part in normalized_weekday.split():
-                    if part in WEEKDAYS_PL:
-                        weekday_idx = WEEKDAYS_PL[part]
-                        break
-            if weekday_idx is not None:
-                new_date_iso = resolve_weekday_to_date(weekday_idx)
     # vague: suggest options
     if ai.get("vague") and not new_date_iso:
         opts = suggest_day_options(how_many=3, prefer_next_week=("przysz" in txt or "nastepn" in txt))
@@ -968,7 +961,11 @@ Wybierz akcję:
         [
             InlineKeyboardButton("✅ Potwierdź", callback_data=f"confirm_{reservation_id}_{user_id}"),
             InlineKeyboardButton("❌ Odrzuć", callback_data=f"reject_{reservation_id}_{user_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("📝 Szczegóły", callback_data=f"details_{reservation_id}_{user_id}"),
+            InlineKeyboardButton("🗑 Anuluj ", callback_data=f"cancel_{reservation_id}_{user_id}"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     try:
@@ -1006,27 +1003,6 @@ async def handle_telegram_callback(update, context):
             await query.edit_message_text("⚠️ Błędny format daty.")
             return
 
-        duration_hours = item.get("duration") or 2
-        is_free, err = check_availability_in_calendar(full_date, duration_hours)
-        if is_free is None:
-            logging.warning(f"Availability check failed for reservation {reservation_id}: {err}")
-            await query.message.reply_text("⚠️ Nie udalo sie sprawdzic dostepnosci. Sprobuj ponownie za chwile.")
-            return
-        if not is_free:
-            logging.info(f"Reservation {reservation_id} marked as conflict during confirmation.")
-            table.update_item(
-                Key={"user_id": user_id, "reservation_id": reservation_id},
-                UpdateExpression="SET #s=:s, reminded=:r",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "conflict", ":r": False},
-            )
-            send_message(
-                user_id,
-                "Termin został w miedzyczasie zajęty. Napisz proszę inną datę lub godzinę, a poszukamy wolnego slotu.",
-            )
-            await query.message.reply_text("⚠️ Termin jest już zajęty. Rezerwacja oznaczona jako konflikt.")
-            return
-
         table.update_item(
             Key={"user_id": user_id, "reservation_id": reservation_id},
             UpdateExpression="SET #s=:s, reminded=:r",
@@ -1038,9 +1014,9 @@ async def handle_telegram_callback(update, context):
             date=full_date,
             user_id=user_id,
             people=item.get("people"),
-            duration_hours=duration_hours,
+            duration_hours=item.get("duration") or 2,
         )
-        send_message(user_id, f"✅ Twoja rezerwacja zostala potwierdzona. Zapraszamy w dniu {full_date.strftime('%d.%m.%Y %H:%M')}")
+        send_message(user_id, f"✅ Twoja rezerwacja została potwierdzona. Zapraszamy w dniu {full_date.strftime('%d.%m.%Y %H:%M')}")
         # Do not edit the original details message; send a separate confirmation
         await query.message.reply_text("✅ Rezerwacja potwierdzona!")
 
