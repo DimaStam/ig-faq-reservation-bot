@@ -348,6 +348,29 @@ def format_free_ranges(ranges: List[Tuple[datetime, datetime]], max_items: int =
     return ", ".join(out) if out else "brak"
 
 
+
+
+def build_outside_hours_message(start_dt: datetime, duration_hours: int, max_items: int = 3) -> Optional[str]:
+    wh = OPENING_HOURS.get(start_dt.weekday())
+    req_end = start_dt + timedelta(hours=_hours_to_float(duration_hours, default=2.0))
+    if not wh:
+        hours_txt = "Tego dnia studio jest zamkniete."
+    else:
+        open_h, close_h = wh
+        day_open = start_dt.replace(hour=open_h, minute=0, second=0, microsecond=0)
+        day_close = start_dt.replace(hour=close_h, minute=0, second=0, microsecond=0)
+        if start_dt >= day_open and req_end <= day_close:
+            return None
+        hours_txt = f"Studio przyjmuje rezerwacje w godzinach {open_h:02d}:00-{close_h:02d}:00."
+    free_ranges = compute_free_ranges_for_day(start_dt, duration_hours)
+    slots_txt = format_free_ranges(free_ranges, max_items=max_items)
+    return (
+        "Ten termin wypada poza godzinami otwarcia. "
+        + hours_txt
+        + f" Dostępne przedziały tego dnia (min {duration_hours}h): {slots_txt}. "
+        + "Podaj proszę czas w tych godzinach albo wybierz inny dzień."
+    )
+
 def check_availability_in_calendar(start_dt: datetime, duration_hours: int = 2) -> Tuple[Optional[bool], Optional[str]]:
     try:
         req_end = start_dt + timedelta(hours=_hours_to_float(duration_hours, default=2.0))
@@ -877,6 +900,29 @@ def handle_reservation_step(sender_id: str, user_message: str) -> str:
     if not current.get("time"):
         return "Proszę podać godzinę rezerwacji (np. '18:00')."
     
+    if current.get("date") and current.get("time") and not current.get("duration"):
+        baseline_duration = current.get("duration") or 2
+        full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
+        now_naive = _now_pl_naive()
+        if full_dt < now_naive:
+            free_ranges = compute_free_ranges_for_day(full_dt, baseline_duration)
+            if full_dt.date() == now_naive.date() and free_ranges:
+                current["time"] = None
+                _save_current(sender_id, current)
+                return "Nie można rezerwować terminu z przeszłości. Dostępne dziś: " + format_free_ranges(free_ranges) + ". Podaj proszę inną godzinę lub dzień."
+            current["date"], current["time"] = None, None
+            opts = suggest_day_options(how_many=3)
+            current["awaiting_day_choice"] = True
+            current["suggested_options"] = [o.date().isoformat() for o in opts]
+            _save_current(sender_id, current)
+            return "Nie można rezerwować terminu z przeszłości. " + _format_options_message(opts, people_hint=current.get("people"))
+        early_after_hours_msg = build_outside_hours_message(full_dt, baseline_duration)
+        if early_after_hours_msg:
+            current["time"] = None
+            current["awaiting_day_choice"] = False
+            _save_current(sender_id, current)
+            return early_after_hours_msg
+
     if not current.get("duration"):
         m_bare = re.match(r"^\s*(\d{1,2})\s*$", txt)
         if m_bare:
@@ -893,9 +939,10 @@ def handle_reservation_step(sender_id: str, user_message: str) -> str:
             return "Na ile godzin chcesz zarezerwować? Rekomendujemy 2 godziny. Napisz np. '2 godziny'."
 
     # At this point we have date+time+people+duration — validate and check availability
+    duration_hours = current.get("duration") or 2
     full_dt = datetime.fromisoformat(current["date"] + "T" + current["time"])
     if full_dt < _now_pl_naive():
-        free_ranges = compute_free_ranges_for_day(full_dt, current.get("duration") or 2)
+        free_ranges = compute_free_ranges_for_day(full_dt, duration_hours)
         if full_dt.date() == _now_pl_naive().date() and free_ranges:
             current["time"] = None
             _save_current(sender_id, current)
@@ -907,7 +954,14 @@ def handle_reservation_step(sender_id: str, user_message: str) -> str:
         _save_current(sender_id, current)
         return "Nie można rezerwować terminu z przeszłości. " + _format_options_message(opts, people_hint=current.get("people"))
 
-    is_free, err = check_availability_in_calendar(full_dt, duration_hours=current.get("duration") or 2)
+    after_hours_msg = build_outside_hours_message(full_dt, duration_hours)
+    if after_hours_msg:
+        current["time"] = None
+        current["awaiting_day_choice"] = False
+        _save_current(sender_id, current)
+        return after_hours_msg
+
+    is_free, err = check_availability_in_calendar(full_dt, duration_hours=duration_hours)
     if is_free is None:
         return "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę."
 
@@ -927,7 +981,7 @@ def handle_reservation_step(sender_id: str, user_message: str) -> str:
         return "__NOOP__"
 
     # busy -> propose alternatives
-    free_ranges = compute_free_ranges_for_day(full_dt, current.get("duration") or 2)
+    free_ranges = compute_free_ranges_for_day(full_dt, duration_hours)
     if free_ranges:
         current["time"] = None
         current["awaiting_day_choice"] = False
@@ -1298,6 +1352,13 @@ def webhook():
                             _save_current(sender_id, active)
                             full_dt = datetime.fromisoformat(active["date"] + "T" + active["time"])
                             dur3 = active.get("duration") or 2
+                            after_hours_msg = build_outside_hours_message(full_dt, dur3)
+                            if after_hours_msg:
+                                active["time"] = None
+                                active["awaiting_day_choice"] = False
+                                _save_current(sender_id, active)
+                                send_message(sender_id, after_hours_msg)
+                                continue
                             is_free, err = check_availability_in_calendar(full_dt, duration_hours=dur3)
                             if is_free is None:
                                 send_message(sender_id, "⚠️ Nie udało się sprawdzić dostępności. Podaj proszę inny termin albo spróbuj ponownie za chwilę.")

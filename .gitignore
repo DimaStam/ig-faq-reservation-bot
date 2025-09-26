@@ -1,6 +1,5 @@
 .env
-temp.ig_chat_bot copy.py
-temp.ig_chat_bot copy1.py
+ig_chat_bot_backup.py
 clear_cache.txt
 venv/
 __pycache__/
